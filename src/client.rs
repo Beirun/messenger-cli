@@ -268,6 +268,7 @@ impl Client {
             .context("sending the message request")?;
 
         let mut messages: Vec<MessageSummary> = Vec::new();
+        let mut attachments: HashMap<String, usize> = HashMap::new();
         let deadline = TokioInstant::now() + Duration::from_secs(10);
         while let Some(event) = socket.next_event(deadline).await? {
             match event {
@@ -275,14 +276,19 @@ impl Client {
                     database: sync,
                     steps,
                 } if sync == database => {
-                    for op in ls::calls(&steps) {
+                    let calls = ls::calls(&steps);
+                    count_attachments(&calls, thread_key, &mut attachments);
+                    for op in calls {
                         if let Some(message) = ops::message(op, Some(thread_key), sync_group) {
                             if message.thread_key == thread_key {
+                                let count =
+                                    attachments.get(&message.message_id).copied().unwrap_or(0);
                                 messages.push(MessageSummary {
                                     message_id: message.message_id,
                                     ts_ms: message.ts_ms,
                                     sender_id: message.sender_id,
                                     text: message.text,
+                                    attachments: count,
                                 });
                             }
                         }
@@ -309,7 +315,7 @@ impl Client {
     ) -> Result<Option<String>> {
         let key: i64 = thread_key.parse().context("thread key must be numeric")?;
         let (payload, otid) = message_task(key, text, &[], sync_group);
-        self.send_task_and_confirm(thread_key, payload, otid, Some(text), sync_group)
+        self.send_task_and_confirm(thread_key, payload, otid, Some(text), false, sync_group)
             .await
     }
 
@@ -324,7 +330,7 @@ impl Client {
         let upload = self.upload_attachment(thread_key, path).await?;
         let key: i64 = thread_key.parse().context("thread key must be numeric")?;
         let (payload, otid) = message_task(key, caption.trim(), &[upload.fbid], sync_group);
-        self.send_task_and_confirm(thread_key, payload, otid, None, sync_group)
+        self.send_task_and_confirm(thread_key, payload, otid, None, true, sync_group)
             .await
     }
 
@@ -402,6 +408,7 @@ impl Client {
         payload: Value,
         otid: i64,
         expect_text: Option<&str>,
+        expect_attachment: bool,
         sync_group: u8,
     ) -> Result<Option<String>> {
         let key: i64 = thread_key.parse().context("thread key must be numeric")?;
@@ -431,6 +438,7 @@ impl Client {
             .context("requesting the thread")?;
 
         let mut sent_id = None;
+        let mut attachments: HashMap<String, usize> = HashMap::new();
         let deadline = TokioInstant::now() + Duration::from_secs(10);
         while let Some(event) = socket.next_event(deadline).await? {
             match event {
@@ -438,12 +446,15 @@ impl Client {
                     database: sync,
                     steps,
                 } if sync == database => {
-                    for op in ls::calls(&steps) {
+                    let calls = ls::calls(&steps);
+                    count_attachments(&calls, thread_key, &mut attachments);
+                    for op in calls {
                         if let Some(message) = ops::message(op, Some(thread_key), sync_group)
                             && message.thread_key == thread_key
                             && message.sender_id.as_deref() == me
                             && message.ts_ms >= sent_after
                             && expect_text.is_none_or(|text| message.text.as_deref() == Some(text))
+                            && (!expect_attachment || attachments.contains_key(&message.message_id))
                         {
                             sent_id = Some(message.message_id);
                         }
@@ -511,6 +522,8 @@ pub struct MessageSummary {
     pub ts_ms: i64,
     pub sender_id: Option<String>,
     pub text: Option<String>,
+    /// How many attachments the message carries.
+    pub attachments: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -530,15 +543,20 @@ pub struct UploadedAttachment {
     pub filename: String,
 }
 
-/// The label-46 task for a message, with upload fbids as its attachments.
+/// The label-46 task for a message, with upload fbids as its attachments. A message
+/// carrying media has to say so in `send_type`, or the gateway drops the attachment
+/// and keeps only the text.
 fn message_task(thread_key: i64, text: &str, attachments: &[i64], sync_group: u8) -> (Value, i64) {
+    const TEXT: i32 = 1;
+    const MEDIA: i32 = 3;
     let otid = Utc::now().timestamp_micros();
     let has_links = text.contains("http://") || text.contains("https://");
+    let send_type = if attachments.is_empty() { TEXT } else { MEDIA };
     let mut payload = serde_json::json!({
         "thread_id": thread_key,
         "otid": otid.to_string(),
         "source": 65537,
-        "send_type": 1,
+        "send_type": send_type,
         "sync_group": sync_group,
         "initiating_source": 1,
         "skip_url_preview_gen": 0,
@@ -648,6 +666,17 @@ fn reaction_task(
     });
     let queue = serde_json::json!(["reaction", message_id]).to_string();
     (payload, queue)
+}
+
+/// How many attachments each message in a step tree carries.
+fn count_attachments(calls: &[&[Value]], thread_key: &str, counts: &mut HashMap<String, usize>) {
+    for op in calls {
+        if let Some(attachment) = ops::attachment(op)
+            && attachment.thread_key == thread_key
+        {
+            *counts.entry(attachment.message_id).or_default() += 1;
+        }
+    }
 }
 
 /// The ops the server echoes once a reaction is stored.
@@ -818,8 +847,10 @@ mod tests {
         let (payload, otid) = message_task(42, "caption", &[99], 1);
         assert_eq!(payload["attachment_fbids"][0], 99);
         assert_eq!(payload["text"], "caption");
+        assert_eq!(payload["send_type"], 3);
         assert_eq!(payload["otid"], otid.to_string());
         let (plain, _) = message_task(42, "", &[], 1);
+        assert_eq!(plain["send_type"], 1);
         assert!(plain.get("text").is_none());
         assert!(plain.get("attachment_fbids").is_none());
     }
