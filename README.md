@@ -18,9 +18,11 @@ lets the Messenger web client do the encryption.
 | `messenger chats` | List recent chats, newest first. |
 | `messenger read <chat_id>` | Read the newest messages of a chat. |
 | `messenger send <chat_id> <text>` | Send a text message. Use `-` as the text to read it from stdin. |
+| `messenger react <chat_id> <message_id> <emoji>` | React to a message in a group chat. |
 
 `chats` and `read` take `-n/--limit`, between 1 and 100. `read` and `send` take
-`--backend gateway|browser`. Every command takes `--json` for machine-readable output.
+`--backend gateway|browser`. Every command takes `--json` for machine-readable output. `read`
+prints the message ids that `react` takes.
 
 ```sh
 messenger chats -n 10
@@ -67,6 +69,9 @@ drops plaintext sends to encrypted one-to-one chats, so those appear to succeed 
 list to stop changing, and reads the rendered messages. Sends type into the composer, reload the
 thread, and report success only if the message appears afterwards. Reads return only what is
 currently rendered, so long histories are partial, and opening a chat can mark it read.
+
+Reactions only exist on the gateway path, so they work in group chats and not in encrypted
+one-to-one chats.
 
 ## Configuration
 

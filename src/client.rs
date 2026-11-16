@@ -394,6 +394,91 @@ impl Client {
         socket.close().await;
         Ok(sent_id)
     }
+
+    /// React to a message, or remove the reaction with an empty emoji.
+    pub async fn send_reaction(
+        &self,
+        thread_key: &str,
+        message_id: &str,
+        emoji: &str,
+        sync_group: u8,
+    ) -> Result<bool> {
+        let raw = std::fs::read_to_string(crate::auth::cookies_path()?)
+            .context("reading the cookie file")?;
+        let mut jar = CrateJar::from_json(&raw).context("parsing the cookie file")?;
+
+        let (_, _, html) = self.home_page().await?;
+        let config =
+            page::scrape(&html).map_err(|err| anyhow::anyhow!("reading the page: {err}"))?;
+
+        let mut cursor = None;
+        for preloader in &config.preloaders {
+            if preloader.database != u32::from(sync_group) {
+                continue;
+            }
+            let steps = self.snapshot(&config, preloader).await?;
+            cursor = ls::sync_cursor(&steps);
+            if cursor.is_some() {
+                break;
+            }
+        }
+        let cursor =
+            cursor.with_context(|| format!("no sync cursor for sync group {sync_group}"))?;
+
+        let key: i64 = thread_key.parse().context("thread key must be numeric")?;
+        let (payload, queue) =
+            reaction_task(key, message_id, self.jar.user_id(), emoji, sync_group);
+
+        let mut socket = Socket::connect(&config, &mut jar)
+            .await
+            .context("connecting to the gateway")?;
+        socket
+            .open_sync(cursor.database, &cursor.next)
+            .await
+            .context("opening the sync stream")?;
+
+        let deadline = TokioInstant::now() + Duration::from_secs(10);
+        while let Some(event) = socket.next_event(deadline).await? {
+            if let Event::Sync { database, .. } = event {
+                if database == cursor.database {
+                    break;
+                }
+            }
+        }
+
+        socket
+            .send_task("29", &queue, payload)
+            .await
+            .context("sending the reaction task")?;
+
+        // Task replies are dropped by the client, so confirmation comes from the op the
+        // server pushes back on the sync stream.
+        let mut accepted = false;
+        let mut done = false;
+        let deadline = TokioInstant::now() + Duration::from_secs(10);
+        while !done {
+            let Some(event) = socket.next_event(deadline).await? else {
+                break;
+            };
+            match event {
+                Event::Sync { steps, .. } => accepted |= reaction_echo(&steps),
+                Event::TaskDone => done = true,
+            }
+        }
+        if !accepted {
+            let deadline = TokioInstant::now() + Duration::from_secs(5);
+            while !accepted {
+                let Some(event) = socket.next_event(deadline).await? else {
+                    break;
+                };
+                if let Event::Sync { steps, .. } = event {
+                    accepted = reaction_echo(&steps);
+                }
+            }
+        }
+        socket.close().await;
+        Ok(accepted)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,6 +496,36 @@ pub struct ThreadSummary {
     pub is_group: bool,
     pub last_activity_ms: Option<i64>,
     pub sync_group: u8,
+}
+
+/// `SendReactionTask`: label `29`, queue `["reaction", <message_id>]`. An empty
+/// reaction removes it, and `send_attribution` 65537 is MESSENGER_INBOX_IN_THREAD.
+fn reaction_task(
+    thread_key: i64,
+    message_id: &str,
+    actor: Option<&str>,
+    emoji: &str,
+    sync_group: u8,
+) -> (Value, String) {
+    let payload = serde_json::json!({
+        "thread_key": thread_key,
+        "timestamp_ms": Utc::now().timestamp_millis(),
+        "message_id": message_id,
+        "actor_id": actor.and_then(|id| id.parse::<i64>().ok()),
+        "reaction": emoji,
+        "reaction_style": Value::Null,
+        "sync_group": sync_group,
+        "send_attribution": 65537,
+    });
+    let queue = serde_json::json!(["reaction", message_id]).to_string();
+    (payload, queue)
+}
+
+/// The ops the server echoes once a reaction is stored.
+fn reaction_echo(steps: &Value) -> bool {
+    ls::calls(steps)
+        .into_iter()
+        .any(|op| ops::name(op).is_some_and(|name| name.to_ascii_lowercase().contains("reaction")))
 }
 
 fn boxed_string(value: &Value) -> Option<&str> {
@@ -543,5 +658,36 @@ mod tests {
     #[test]
     fn reports_missing_tokens() {
         assert_eq!(extract_tokens("<html></html>"), None);
+    }
+
+    #[test]
+    fn builds_the_reaction_task() {
+        let (payload, queue) = reaction_task(42, "mid.123", Some("10001"), "😆", 1);
+        assert_eq!(queue, r#"["reaction","mid.123"]"#);
+        assert_eq!(payload["thread_key"], 42);
+        assert_eq!(payload["message_id"], "mid.123");
+        assert_eq!(payload["actor_id"], 10001);
+        assert_eq!(payload["reaction"], "😆");
+        assert_eq!(payload["reaction_style"], Value::Null);
+        assert_eq!(payload["send_attribution"], 65537);
+        assert_eq!(payload["sync_group"], 1);
+        assert!(payload["timestamp_ms"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn sees_the_reaction_echo() {
+        let echo: Value =
+            serde_json::from_str(r#"[[5,"replaceOptimisticReaction",[19,"1"]]]"#).unwrap();
+        assert!(reaction_echo(&echo));
+        let other: Value =
+            serde_json::from_str(r#"[[5,"updateOrInsertMessage",[19,"1"]]]"#).unwrap();
+        assert!(!reaction_echo(&other));
+    }
+
+    #[test]
+    fn omits_an_unparsable_actor() {
+        let (payload, _) = reaction_task(1, "mid.1", None, "", 1);
+        assert_eq!(payload["actor_id"], Value::Null);
+        assert_eq!(payload["reaction"], "");
     }
 }

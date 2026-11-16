@@ -58,6 +58,15 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// React to a message in a group chat
+    React {
+        /// Chat or thread id
+        chat_id: String,
+        /// Message id, as printed by read
+        message_id: String,
+        /// One unicode emoji
+        emoji: String,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -100,13 +109,21 @@ async fn run(cli: Cli) -> Result<()> {
             backend,
             yes,
         } => send(cli.json, chat_id, text, backend, yes).await,
+        Command::React {
+            chat_id,
+            message_id,
+            emoji,
+        } => react(cli.json, chat_id, message_id, emoji).await,
     }
 }
 
 async fn status(json: bool) -> Result<()> {
     let path = auth::cookies_path()?;
     if !path.exists() {
-        bail!("no cookie file at {}; run `messenger login`", path.display());
+        bail!(
+            "no cookie file at {}; run `messenger login`",
+            path.display()
+        );
     }
     let jar = CookieJar::load(&path)?;
     let missing = jar.missing_required();
@@ -192,7 +209,10 @@ async fn chats(json: bool, limit: usize) -> Result<()> {
             .last_activity_ms
             .map(format_ms)
             .unwrap_or_else(|| "-".to_string());
-        lines.push(format!("- {title} [{kind}] {when} key={}", thread.thread_key));
+        lines.push(format!(
+            "- {title} [{kind}] {when} key={}",
+            thread.thread_key
+        ));
     }
     println!("{}", lines.join("\n"));
     Ok(())
@@ -311,6 +331,35 @@ async fn send(
     Ok(())
 }
 
+async fn react(json: bool, chat_id: String, message_id: String, emoji: String) -> Result<()> {
+    check_chat_id(&chat_id)?;
+    let message_id = message_id.trim();
+    if message_id.is_empty() {
+        bail!("message_id must not be empty");
+    }
+    let emoji = emoji.trim();
+    if emoji.is_empty() || emoji.chars().count() > 8 {
+        bail!("emoji must be one emoji");
+    }
+    let accepted = Client::new(load_jar()?)?
+        .send_reaction(&chat_id, message_id, emoji, 1)
+        .await?;
+    if json {
+        return print_json(&json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "emoji": emoji,
+            "accepted": accepted,
+        }));
+    }
+    if accepted {
+        println!("reacted {emoji} to {message_id} in {chat_id}");
+    } else {
+        println!("sent the reaction for {message_id} to {chat_id}; the gateway did not confirm it");
+    }
+    Ok(())
+}
+
 fn confirm(chat_id: &str, text: &str, backend: Backend) -> Result<()> {
     if !io::stdin().is_terminal() {
         bail!("refusing to send without --yes when stdin is not a terminal");
@@ -323,10 +372,7 @@ fn confirm(chat_id: &str, text: &str, backend: Backend) -> Result<()> {
     io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
-    if !matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ) {
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         bail!("cancelled");
     }
     Ok(())
@@ -335,7 +381,10 @@ fn confirm(chat_id: &str, text: &str, backend: Backend) -> Result<()> {
 fn load_jar() -> Result<CookieJar> {
     let path = auth::cookies_path()?;
     if !path.exists() {
-        bail!("no cookie file at {}; run `messenger login`", path.display());
+        bail!(
+            "no cookie file at {}; run `messenger login`",
+            path.display()
+        );
     }
     let jar = CookieJar::load(&path)?;
     if !jar.missing_required().is_empty() {
