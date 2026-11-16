@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -67,6 +68,19 @@ enum Command {
         /// One unicode emoji
         emoji: String,
     },
+    /// Send a file, image, video or audio to a chat
+    Attach {
+        /// Chat or thread id
+        chat_id: String,
+        /// Path to the file
+        path: PathBuf,
+        /// Caption to send with the file
+        #[arg(short = 'm', long)]
+        caption: Option<String>,
+        /// Send without asking for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -114,6 +128,12 @@ async fn run(cli: Cli) -> Result<()> {
             message_id,
             emoji,
         } => react(cli.json, chat_id, message_id, emoji).await,
+        Command::Attach {
+            chat_id,
+            path,
+            caption,
+            yes,
+        } => attach(cli.json, chat_id, path, caption, yes).await,
     }
 }
 
@@ -360,15 +380,63 @@ async fn react(json: bool, chat_id: String, message_id: String, emoji: String) -
     Ok(())
 }
 
+async fn attach(
+    json: bool,
+    chat_id: String,
+    path: PathBuf,
+    caption: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    check_chat_id(&chat_id)?;
+    if !path.is_file() {
+        bail!("{} is not a file", path.display());
+    }
+    if !yes {
+        confirm_attachment(&chat_id, &path, caption.as_deref())?;
+    }
+    let caption = caption.unwrap_or_default();
+    let id = Client::new(load_jar()?)?
+        .send_attachment(&chat_id, &path, &caption, 1)
+        .await?;
+    if json {
+        return print_json(&json!({
+            "chat_id": chat_id,
+            "file": path.display().to_string(),
+            "message_id": id,
+            "confirmed": id.is_some(),
+        }));
+    }
+    match id {
+        Some(id) => println!("sent {} to {chat_id} (message {id})", path.display()),
+        None => println!(
+            "uploaded {} but the message did not appear in {chat_id}; try again",
+            path.display()
+        ),
+    }
+    Ok(())
+}
+
 fn confirm(chat_id: &str, text: &str, backend: Backend) -> Result<()> {
+    ask(&format!(
+        "send to {chat_id} via {}: \"{}\"",
+        backend.label(),
+        clip(text, 60)
+    ))
+}
+
+fn confirm_attachment(chat_id: &str, path: &Path, caption: Option<&str>) -> Result<()> {
+    let caption = match caption.filter(|caption| !caption.trim().is_empty()) {
+        Some(caption) => format!(" with \"{}\"", clip(caption, 60)),
+        None => String::new(),
+    };
+    ask(&format!("send {} to {chat_id}{caption}", path.display()))
+}
+
+fn ask(question: &str) -> Result<()> {
     if !io::stdin().is_terminal() {
         bail!("refusing to send without --yes when stdin is not a terminal");
     }
-    eprint!(
-        "send to {chat_id} via {}: \"{}\" [y/N] ",
-        backend.label(),
-        clip(text, 60)
-    );
+    eprint!("{question} [y/N] ");
     io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;

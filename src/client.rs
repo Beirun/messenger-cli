@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -104,9 +105,7 @@ impl Client {
     }
 
     pub async fn list_threads(&self) -> Result<Vec<ThreadSummary>> {
-        let (_, _, html) = self.home_page().await?;
-        let config =
-            page::scrape(&html).map_err(|err| anyhow::anyhow!("reading the page: {err}"))?;
+        let config = self.page_config().await?;
 
         let mut all = Vec::new();
         for preloader in &config.preloaders {
@@ -203,34 +202,38 @@ impl Client {
         Ok(data.get("step").cloned().unwrap_or(Value::Null))
     }
 
-    pub async fn read_messages(
-        &self,
-        thread_key: &str,
-        limit: usize,
-        sync_group: u8,
-    ) -> Result<Vec<MessageSummary>> {
-        let raw = std::fs::read_to_string(crate::auth::cookies_path()?)
-            .context("reading the cookie file")?;
-        let mut jar = CrateJar::from_json(&raw).context("parsing the cookie file")?;
-
+    async fn page_config(&self) -> Result<page::PageConfig> {
         let (_, _, html) = self.home_page().await?;
-        let config =
-            page::scrape(&html).map_err(|err| anyhow::anyhow!("reading the page: {err}"))?;
+        page::scrape(&html).map_err(|err| anyhow::anyhow!("reading the page: {err}"))
+    }
 
+    /// Where `sync_group`'s stream stands, from the matching preloader.
+    async fn sync_cursor(
+        &self,
+        config: &page::PageConfig,
+        sync_group: u8,
+    ) -> Result<ls::SyncCursor> {
         let mut cursor = None;
         for preloader in &config.preloaders {
             if preloader.database != u32::from(sync_group) {
                 continue;
             }
-            let steps = self.snapshot(&config, preloader).await?;
+            let steps = self.snapshot(config, preloader).await?;
             cursor = ls::sync_cursor(&steps);
             if cursor.is_some() {
                 break;
             }
         }
-        let cursor =
-            cursor.with_context(|| format!("no sync cursor for sync group {sync_group}"))?;
+        cursor.with_context(|| format!("no sync cursor for sync group {sync_group}"))
+    }
 
+    /// A gateway socket on `sync_group`'s stream, past its first push.
+    async fn sync_socket(&self, sync_group: u8) -> Result<(Socket, u32)> {
+        let raw = std::fs::read_to_string(crate::auth::cookies_path()?)
+            .context("reading the cookie file")?;
+        let mut jar = CrateJar::from_json(&raw).context("parsing the cookie file")?;
+        let config = self.page_config().await?;
+        let cursor = self.sync_cursor(&config, sync_group).await?;
         let mut socket = Socket::connect(&config, &mut jar)
             .await
             .context("connecting to the gateway")?;
@@ -247,7 +250,16 @@ impl Client {
                 }
             }
         }
+        Ok((socket, cursor.database))
+    }
 
+    pub async fn read_messages(
+        &self,
+        thread_key: &str,
+        limit: usize,
+        sync_group: u8,
+    ) -> Result<Vec<MessageSummary>> {
+        let (mut socket, database) = self.sync_socket(sync_group).await?;
         let key: i64 = thread_key.parse().context("thread key must be numeric")?;
         let payload = ls::fetch_messages(key, Utc::now().timestamp_millis(), sync_group);
         socket
@@ -259,7 +271,10 @@ impl Client {
         let deadline = TokioInstant::now() + Duration::from_secs(10);
         while let Some(event) = socket.next_event(deadline).await? {
             match event {
-                Event::Sync { database, steps } if database == cursor.database => {
+                Event::Sync {
+                    database: sync,
+                    steps,
+                } if sync == database => {
                     for op in ls::calls(&steps) {
                         if let Some(message) = ops::message(op, Some(thread_key), sync_group) {
                             if message.thread_key == thread_key {
@@ -292,61 +307,105 @@ impl Client {
         text: &str,
         sync_group: u8,
     ) -> Result<Option<String>> {
-        let raw = std::fs::read_to_string(crate::auth::cookies_path()?)
-            .context("reading the cookie file")?;
-        let mut jar = CrateJar::from_json(&raw).context("parsing the cookie file")?;
-
-        let (_, _, html) = self.home_page().await?;
-        let config =
-            page::scrape(&html).map_err(|err| anyhow::anyhow!("reading the page: {err}"))?;
-
-        let mut cursor = None;
-        for preloader in &config.preloaders {
-            if preloader.database != u32::from(sync_group) {
-                continue;
-            }
-            let steps = self.snapshot(&config, preloader).await?;
-            cursor = ls::sync_cursor(&steps);
-            if cursor.is_some() {
-                break;
-            }
-        }
-        let cursor =
-            cursor.with_context(|| format!("no sync cursor for sync group {sync_group}"))?;
-
         let key: i64 = thread_key.parse().context("thread key must be numeric")?;
-        let otid = Utc::now().timestamp_micros();
-        let has_links = text.contains("http://") || text.contains("https://");
-        let payload = serde_json::json!({
-            "thread_id": key,
-            "otid": otid.to_string(),
-            "source": 65537,
-            "send_type": 1,
-            "sync_group": sync_group,
-            "text": text,
-            "initiating_source": 1,
-            "skip_url_preview_gen": 0,
-            "text_has_links": i32::from(has_links),
-            "multitab_env": 0,
-        });
-
-        let mut socket = Socket::connect(&config, &mut jar)
+        let (payload, otid) = message_task(key, text, &[], sync_group);
+        self.send_task_and_confirm(thread_key, payload, otid, Some(text), sync_group)
             .await
-            .context("connecting to the gateway")?;
-        socket
-            .open_sync(cursor.database, &cursor.next)
-            .await
-            .context("opening the sync stream")?;
+    }
 
-        let deadline = TokioInstant::now() + Duration::from_secs(10);
-        while let Some(event) = socket.next_event(deadline).await? {
-            if let Event::Sync { database, .. } = event {
-                if database == cursor.database {
-                    break;
-                }
-            }
+    /// Upload a file, then send it as a message with an optional caption.
+    pub async fn send_attachment(
+        &self,
+        thread_key: &str,
+        path: &Path,
+        caption: &str,
+        sync_group: u8,
+    ) -> Result<Option<String>> {
+        let upload = self.upload_attachment(thread_key, path).await?;
+        let key: i64 = thread_key.parse().context("thread key must be numeric")?;
+        let (payload, otid) = message_task(key, caption.trim(), &[upload.fbid], sync_group);
+        self.send_task_and_confirm(thread_key, payload, otid, None, sync_group)
+            .await
+    }
+
+    /// Send the file to Meta and return the attachment id a message refers to.
+    pub async fn upload_attachment(
+        &self,
+        thread_key: &str,
+        path: &Path,
+    ) -> Result<UploadedAttachment> {
+        let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        if data.is_empty() {
+            bail!("{} is empty", path.display());
         }
+        let config = self.page_config().await?;
+        let dtsg = config.dtsg.clone().unwrap_or_default();
+        let jazoest = jazoest(&dtsg);
+        let revision = config.revision.clone().unwrap_or_default();
+        let lsd = config.lsd.clone().unwrap_or_default();
+        let mut name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_string();
 
+        let part = reqwest::multipart::Part::bytes(data)
+            .file_name(name.clone())
+            .mime_str(mime_type(path))?;
+        let response = self
+            .http
+            .post("https://www.messenger.com/ajax/mercury/upload.php")
+            .query(&[
+                ("__a", "1"),
+                ("__user", config.user_id.as_str()),
+                ("__req", "1"),
+                ("fb_dtsg", dtsg.as_str()),
+                ("lsd", lsd.as_str()),
+                ("jazoest", jazoest.as_str()),
+                ("__rev", revision.as_str()),
+            ])
+            .header("Accept", "*/*")
+            .header("Origin", MESSENGER_HOME)
+            .header("Referer", format!("{MESSENGER_HOME}t/{thread_key}/"))
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Cookie", self.jar.header_for("www.messenger.com"))
+            .multipart(reqwest::multipart::Form::new().part("farr", part))
+            .send()
+            .await
+            .context("uploading the attachment")?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("reading the upload response")?;
+        if !status.is_success() {
+            let preview: String = body.chars().take(200).collect();
+            bail!("upload returned HTTP {status}: {preview}");
+        }
+        let (fbid, remote) = parse_upload(&body)?;
+        if let Some(remote) = remote.filter(|remote| !remote.is_empty()) {
+            name = remote;
+        }
+        Ok(UploadedAttachment {
+            fbid,
+            filename: name,
+        })
+    }
+
+    /// Send a label-46 task and look for the resulting message on the thread.
+    async fn send_task_and_confirm(
+        &self,
+        thread_key: &str,
+        payload: Value,
+        otid: i64,
+        expect_text: Option<&str>,
+        sync_group: u8,
+    ) -> Result<Option<String>> {
+        let key: i64 = thread_key.parse().context("thread key must be numeric")?;
+        let (mut socket, database) = self.sync_socket(sync_group).await?;
         socket
             .send_task("46", &key.to_string(), payload)
             .await
@@ -375,13 +434,16 @@ impl Client {
         let deadline = TokioInstant::now() + Duration::from_secs(10);
         while let Some(event) = socket.next_event(deadline).await? {
             match event {
-                Event::Sync { database, steps } if database == cursor.database => {
+                Event::Sync {
+                    database: sync,
+                    steps,
+                } if sync == database => {
                     for op in ls::calls(&steps) {
                         if let Some(message) = ops::message(op, Some(thread_key), sync_group)
                             && message.thread_key == thread_key
-                            && message.text.as_deref() == Some(text)
                             && message.sender_id.as_deref() == me
                             && message.ts_ms >= sent_after
+                            && expect_text.is_none_or(|text| message.text.as_deref() == Some(text))
                         {
                             sent_id = Some(message.message_id);
                         }
@@ -403,48 +465,10 @@ impl Client {
         emoji: &str,
         sync_group: u8,
     ) -> Result<bool> {
-        let raw = std::fs::read_to_string(crate::auth::cookies_path()?)
-            .context("reading the cookie file")?;
-        let mut jar = CrateJar::from_json(&raw).context("parsing the cookie file")?;
-
-        let (_, _, html) = self.home_page().await?;
-        let config =
-            page::scrape(&html).map_err(|err| anyhow::anyhow!("reading the page: {err}"))?;
-
-        let mut cursor = None;
-        for preloader in &config.preloaders {
-            if preloader.database != u32::from(sync_group) {
-                continue;
-            }
-            let steps = self.snapshot(&config, preloader).await?;
-            cursor = ls::sync_cursor(&steps);
-            if cursor.is_some() {
-                break;
-            }
-        }
-        let cursor =
-            cursor.with_context(|| format!("no sync cursor for sync group {sync_group}"))?;
-
+        let (mut socket, _database) = self.sync_socket(sync_group).await?;
         let key: i64 = thread_key.parse().context("thread key must be numeric")?;
         let (payload, queue) =
             reaction_task(key, message_id, self.jar.user_id(), emoji, sync_group);
-
-        let mut socket = Socket::connect(&config, &mut jar)
-            .await
-            .context("connecting to the gateway")?;
-        socket
-            .open_sync(cursor.database, &cursor.next)
-            .await
-            .context("opening the sync stream")?;
-
-        let deadline = TokioInstant::now() + Duration::from_secs(10);
-        while let Some(event) = socket.next_event(deadline).await? {
-            if let Event::Sync { database, .. } = event {
-                if database == cursor.database {
-                    break;
-                }
-            }
-        }
 
         socket
             .send_task("29", &queue, payload)
@@ -496,6 +520,111 @@ pub struct ThreadSummary {
     pub is_group: bool,
     pub last_activity_ms: Option<i64>,
     pub sync_group: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedAttachment {
+    /// The id a message names in `attachment_fbids`.
+    pub fbid: i64,
+    /// The name the server kept, usually the local file name.
+    pub filename: String,
+}
+
+/// The label-46 task for a message, with upload fbids as its attachments.
+fn message_task(thread_key: i64, text: &str, attachments: &[i64], sync_group: u8) -> (Value, i64) {
+    let otid = Utc::now().timestamp_micros();
+    let has_links = text.contains("http://") || text.contains("https://");
+    let mut payload = serde_json::json!({
+        "thread_id": thread_key,
+        "otid": otid.to_string(),
+        "source": 65537,
+        "send_type": 1,
+        "sync_group": sync_group,
+        "initiating_source": 1,
+        "skip_url_preview_gen": 0,
+        "text_has_links": i32::from(has_links),
+        "multitab_env": 0,
+    });
+    if !text.is_empty() {
+        payload["text"] = Value::from(text);
+    }
+    if !attachments.is_empty() {
+        payload["attachment_fbids"] = serde_json::json!(attachments);
+    }
+    (payload, otid)
+}
+
+/// The content type an upload claims, from the file name.
+fn mime_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("mp3") => "audio/mpeg",
+        Some("m4a") => "audio/mp4",
+        Some("ogg") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Facebook's `jazoest`: `2` followed by the byte sum of the dtsg token.
+fn jazoest(dtsg: &str) -> String {
+    format!("2{}", dtsg.bytes().map(u32::from).sum::<u32>())
+}
+
+/// The attachment id and name out of `/ajax/mercury/upload.php`.
+fn parse_upload(body: &str) -> Result<(i64, Option<String>)> {
+    let body = body.trim_start().strip_prefix("for (;;);").unwrap_or(body);
+    let value: Value = serde_json::from_str(body).context("parsing the upload response")?;
+    if let Some(code) = value
+        .get("error")
+        .and_then(Value::as_i64)
+        .filter(|code| *code != 0)
+    {
+        let summary = value
+            .get("errorSummary")
+            .or_else(|| value.get("errorDescription"))
+            .and_then(Value::as_str)
+            .unwrap_or("no summary");
+        bail!("upload rejected with error {code}: {summary}");
+    }
+    let metadata = value
+        .pointer("/payload/metadata")
+        .context("the upload response carries no metadata")?;
+    let entry = match metadata {
+        Value::Array(items) => items.first().context("the upload metadata is empty")?,
+        Value::Object(map) => map.get("0").context("the upload metadata is empty")?,
+        _ => bail!("unexpected metadata in the upload response"),
+    };
+    let fbid = ["video_id", "audio_id", "image_id", "gif_id", "file_id"]
+        .iter()
+        .find_map(|key| number(entry.get(*key)).filter(|id| *id != 0))
+        .context("the upload response carries no attachment id")?;
+    let name = entry
+        .get("filename")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok((fbid, name))
+}
+
+/// Meta sends ids as either numbers or decimal strings.
+fn number(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::String(text) => text.parse().ok(),
+        Value::Number(number) => number.as_i64(),
+        _ => None,
+    }
 }
 
 /// `SendReactionTask`: label `29`, queue `["reaction", <message_id>]`. An empty
@@ -682,6 +811,48 @@ mod tests {
         let other: Value =
             serde_json::from_str(r#"[[5,"updateOrInsertMessage",[19,"1"]]]"#).unwrap();
         assert!(!reaction_echo(&other));
+    }
+
+    #[test]
+    fn builds_a_message_with_attachments() {
+        let (payload, otid) = message_task(42, "caption", &[99], 1);
+        assert_eq!(payload["attachment_fbids"][0], 99);
+        assert_eq!(payload["text"], "caption");
+        assert_eq!(payload["otid"], otid.to_string());
+        let (plain, _) = message_task(42, "", &[], 1);
+        assert!(plain.get("text").is_none());
+        assert!(plain.get("attachment_fbids").is_none());
+    }
+
+    #[test]
+    fn names_content_types() {
+        assert_eq!(mime_type(Path::new("a/b.PNG")), "image/png");
+        assert_eq!(mime_type(Path::new("clip.mp4")), "video/mp4");
+        assert_eq!(mime_type(Path::new("noext")), "application/octet-stream");
+    }
+
+    #[test]
+    fn reads_the_upload_metadata() {
+        let body = r#"for (;;);{"__ar":1,"payload":{"metadata":[{"image_id":"123456","filename":"shot.png"}]}}"#;
+        assert_eq!(
+            parse_upload(body).unwrap(),
+            (123456, Some("shot.png".to_string()))
+        );
+        let keyed = r#"{"payload":{"metadata":{"0":{"video_id":7}}}}"#;
+        assert_eq!(parse_upload(keyed).unwrap(), (7, None));
+    }
+
+    #[test]
+    fn reports_an_upload_error() {
+        let body = r#"{"error":1357054,"errorSummary":"Please try again"}"#;
+        let error = parse_upload(body).unwrap_err().to_string();
+        assert!(error.contains("1357054"));
+        assert!(error.contains("Please try again"));
+    }
+
+    #[test]
+    fn computes_jazoest() {
+        assert_eq!(jazoest("AQH"), "2218");
     }
 
     #[test]

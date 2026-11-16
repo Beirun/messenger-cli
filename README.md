@@ -19,6 +19,7 @@ lets the Messenger web client do the encryption.
 | `messenger read <chat_id>` | Read the newest messages of a chat. |
 | `messenger send <chat_id> <text>` | Send a text message. Use `-` as the text to read it from stdin. |
 | `messenger react <chat_id> <message_id> <emoji>` | React to a message in a group chat. |
+| `messenger attach <chat_id> <path>` | Send a file, image, video or audio, with `-m/--caption`. |
 
 `chats` and `read` take `-n/--limit`, between 1 and 100. `read` and `send` take
 `--backend gateway|browser`. Every command takes `--json` for machine-readable output. `read`
@@ -71,7 +72,9 @@ thread, and report success only if the message appears afterwards. Reads return 
 currently rendered, so long histories are partial, and opening a chat can mark it read.
 
 Reactions only exist on the gateway path, so they work in group chats and not in encrypted
-one-to-one chats.
+one-to-one chats. Attachments take that route too: the file is uploaded to Meta's mercury
+endpoint and the message refers to the upload id, so encrypted one-to-one chats have no
+attachment path yet either.
 
 ## Configuration
 
