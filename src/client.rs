@@ -207,33 +207,33 @@ impl Client {
         page::scrape(&html).map_err(|err| anyhow::anyhow!("reading the page: {err}"))
     }
 
-    /// Where `sync_group`'s stream stands, from the matching preloader.
-    async fn sync_cursor(
+    /// Where `sync_group`'s stream stands, from the matching preloader, with the
+    /// display names that snapshot carries.
+    async fn sync_start(
         &self,
-        config: &page::PageConfig,
         sync_group: u8,
-    ) -> Result<ls::SyncCursor> {
-        let mut cursor = None;
+    ) -> Result<(page::PageConfig, ls::SyncCursor, HashMap<String, String>)> {
+        let config = self.page_config().await?;
         for preloader in &config.preloaders {
             if preloader.database != u32::from(sync_group) {
                 continue;
             }
-            let steps = self.snapshot(config, preloader).await?;
-            cursor = ls::sync_cursor(&steps);
-            if cursor.is_some() {
-                break;
+            let steps = self.snapshot(&config, preloader).await?;
+            if let Some(cursor) = ls::sync_cursor(&steps) {
+                let names = contacts(&ls::calls(&steps));
+                return Ok((config, cursor, names));
             }
         }
-        cursor.with_context(|| format!("no sync cursor for sync group {sync_group}"))
+        bail!("no sync cursor for sync group {sync_group}")
     }
 
-    /// A gateway socket on `sync_group`'s stream, past its first push.
-    async fn sync_socket(&self, sync_group: u8) -> Result<(Socket, u32)> {
+    /// A gateway socket on `sync_group`'s stream, past its first push, with the
+    /// contact names of the page it started from.
+    async fn sync_socket(&self, sync_group: u8) -> Result<(Socket, u32, HashMap<String, String>)> {
         let raw = std::fs::read_to_string(crate::auth::cookies_path()?)
             .context("reading the cookie file")?;
         let mut jar = CrateJar::from_json(&raw).context("parsing the cookie file")?;
-        let config = self.page_config().await?;
-        let cursor = self.sync_cursor(&config, sync_group).await?;
+        let (config, cursor, names) = self.sync_start(sync_group).await?;
         let mut socket = Socket::connect(&config, &mut jar)
             .await
             .context("connecting to the gateway")?;
@@ -250,7 +250,7 @@ impl Client {
                 }
             }
         }
-        Ok((socket, cursor.database))
+        Ok((socket, cursor.database, names))
     }
 
     pub async fn read_messages(
@@ -259,7 +259,7 @@ impl Client {
         limit: usize,
         sync_group: u8,
     ) -> Result<Vec<MessageSummary>> {
-        let (mut socket, database) = self.sync_socket(sync_group).await?;
+        let (mut socket, database, names) = self.sync_socket(sync_group).await?;
         let key: i64 = thread_key.parse().context("thread key must be numeric")?;
         let payload = ls::fetch_messages(key, Utc::now().timestamp_millis(), sync_group);
         socket
@@ -284,6 +284,10 @@ impl Client {
                                 let count =
                                     attachments.get(&message.message_id).copied().unwrap_or(0);
                                 messages.push(MessageSummary {
+                                    sender_name: message
+                                        .sender_id
+                                        .as_deref()
+                                        .and_then(|id| names.get(id).cloned()),
                                     message_id: message.message_id,
                                     ts_ms: message.ts_ms,
                                     sender_id: message.sender_id,
@@ -412,7 +416,7 @@ impl Client {
         sync_group: u8,
     ) -> Result<Option<String>> {
         let key: i64 = thread_key.parse().context("thread key must be numeric")?;
-        let (mut socket, database) = self.sync_socket(sync_group).await?;
+        let (mut socket, database, _names) = self.sync_socket(sync_group).await?;
         socket
             .send_task("46", &key.to_string(), payload)
             .await
@@ -476,7 +480,7 @@ impl Client {
         emoji: &str,
         sync_group: u8,
     ) -> Result<bool> {
-        let (mut socket, _database) = self.sync_socket(sync_group).await?;
+        let (mut socket, _database, _names) = self.sync_socket(sync_group).await?;
         let key: i64 = thread_key.parse().context("thread key must be numeric")?;
         let (payload, queue) =
             reaction_task(key, message_id, self.jar.user_id(), emoji, sync_group);
@@ -521,6 +525,8 @@ pub struct MessageSummary {
     pub message_id: String,
     pub ts_ms: i64,
     pub sender_id: Option<String>,
+    /// The display name when the inbox snapshot knows this sender.
+    pub sender_name: Option<String>,
     pub text: Option<String>,
     /// How many attachments the message carries.
     pub attachments: usize,
@@ -666,6 +672,19 @@ fn reaction_task(
     });
     let queue = serde_json::json!(["reaction", message_id]).to_string();
     (payload, queue)
+}
+
+/// Display names by user id, from the contact rows a snapshot carries.
+fn contacts(calls: &[&[Value]]) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    for op in calls {
+        if let Some(participant) = ops::participant(op)
+            && let Some(name) = participant.name
+        {
+            names.insert(participant.fb_user_id, name);
+        }
+    }
+    names
 }
 
 /// How many attachments each message in a step tree carries.

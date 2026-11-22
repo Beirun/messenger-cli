@@ -280,6 +280,7 @@ async fn read(json: bool, chat_id: String, limit: u32, backend: Backend) -> Resu
                     "id": message.message_id,
                     "ts_ms": message.ts_ms,
                     "sender": message.sender_id,
+                    "sender_name": message.sender_name,
                     "text": message.text,
                     "attachments": message.attachments,
                 })
@@ -289,7 +290,11 @@ async fn read(json: bool, chat_id: String, limit: u32, backend: Backend) -> Resu
     }
     println!("{} messages", messages.len());
     for message in &messages {
-        let sender = message.sender_id.as_deref().unwrap_or("?");
+        let sender = message
+            .sender_name
+            .as_deref()
+            .or(message.sender_id.as_deref())
+            .unwrap_or("?");
         let text = message.text.as_deref().unwrap_or("(no text)");
         let files = match message.attachments {
             0 => String::new(),

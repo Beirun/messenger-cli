@@ -23,7 +23,8 @@ lets the Messenger web client do the encryption.
 
 `chats` and `read` take `-n/--limit`, between 1 and 100. `read` and `send` take
 `--backend gateway|browser`. Every command takes `--json` for machine-readable output. `read`
-prints the message ids that `react` takes.
+prints the message ids that `react` takes, and names each sender when the inbox snapshot carries
+that contact, falling back to the numeric id.
 
 ```sh
 messenger chats -n 10
