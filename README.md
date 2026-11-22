@@ -20,6 +20,8 @@ lets the Messenger web client do the encryption.
 | `messenger send <chat_id> <text>` | Send a text message. Use `-` as the text to read it from stdin. |
 | `messenger react <chat_id> <message_id> <emoji>` | React to a message in a group chat. |
 | `messenger attach <chat_id> <path>` | Send a file, image, video or audio, with `-m/--caption`. |
+| `messenger unsend <chat_id> <message_id>` | Unsend one of your messages for everyone, after a confirmation prompt. |
+| `messenger remove <chat_id> <message_id>` | Remove a message from your own view. |
 
 `chats` and `read` take `-n/--limit`, between 1 and 100. `read` and `send` take
 `--backend gateway|browser`. Every command takes `--json` for machine-readable output. `read`
@@ -75,7 +77,9 @@ currently rendered, so long histories are partial, and opening a chat can mark i
 Reactions only exist on the gateway path, so they work in group chats and not in encrypted
 one-to-one chats. Attachments take that route too: the file is uploaded to Meta's mercury
 endpoint and the message refers to the upload id, so encrypted one-to-one chats have no
-attachment path yet either.
+attachment path yet either. `unsend` and `remove` are gateway only as well, take a message id
+printed by `read`, and report success only when re-reading the thread shows the message emptied
+or gone.
 
 ## Configuration
 

@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use messenger_cli::{
     auth::{self, CookieJar},
     browser,
-    client::{Client, SessionState},
+    client::{Client, DeleteOutcome, SessionState},
     login,
 };
 use serde_json::{Value, json};
@@ -67,6 +67,23 @@ enum Command {
         message_id: String,
         /// One unicode emoji
         emoji: String,
+    },
+    /// Unsend a message you sent, for everyone
+    Unsend {
+        /// Chat or thread id
+        chat_id: String,
+        /// Message id, as printed by read
+        message_id: String,
+        /// Unsend without asking for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Remove a message from your own view
+    Remove {
+        /// Chat or thread id
+        chat_id: String,
+        /// Message id, as printed by read
+        message_id: String,
     },
     /// Send a file, image, video or audio to a chat
     Attach {
@@ -134,6 +151,15 @@ async fn run(cli: Cli) -> Result<()> {
             caption,
             yes,
         } => attach(cli.json, chat_id, path, caption, yes).await,
+        Command::Unsend {
+            chat_id,
+            message_id,
+            yes,
+        } => unsend(cli.json, chat_id, message_id, yes).await,
+        Command::Remove {
+            chat_id,
+            message_id,
+        } => remove(cli.json, chat_id, message_id).await,
     }
 }
 
@@ -422,6 +448,93 @@ async fn attach(
             "uploaded {} but the message did not appear in {chat_id}; try again",
             path.display()
         ),
+    }
+    Ok(())
+}
+
+async fn unsend(json: bool, chat_id: String, message_id: String, yes: bool) -> Result<()> {
+    check_chat_id(&chat_id)?;
+    let message_id = message_id.trim();
+    if message_id.is_empty() {
+        bail!("message_id must not be empty");
+    }
+    let jar = load_jar()?;
+    let me = jar.user_id().map(str::to_owned);
+    let client = Client::new(jar)?;
+    let messages = client.read_messages(&chat_id, 100, 1).await?;
+    match messages
+        .iter()
+        .find(|message| message.message_id == message_id)
+    {
+        Some(target) if target.sender_id.as_deref() != me.as_deref() => {
+            bail!(
+                "only the sender can unsend for everyone; `messenger remove` hides it from your side"
+            );
+        }
+        Some(_) => {}
+        None => eprintln!(
+            "note: {message_id} is outside the messages read from {chat_id}; \
+             Meta rejects an unsend that is not from you"
+        ),
+    }
+    if !yes {
+        ask(&format!("unsend {message_id} for everyone in {chat_id}"))?;
+    }
+    let outcome = client.unsend_message(&chat_id, message_id, 1).await?;
+    report_delete(json, &chat_id, message_id, "everyone", outcome)
+}
+
+async fn remove(json: bool, chat_id: String, message_id: String) -> Result<()> {
+    check_chat_id(&chat_id)?;
+    let message_id = message_id.trim();
+    if message_id.is_empty() {
+        bail!("message_id must not be empty");
+    }
+    let client = Client::new(load_jar()?)?;
+    let messages = client.read_messages(&chat_id, 100, 1).await?;
+    if !messages
+        .iter()
+        .any(|message| message.message_id == message_id)
+    {
+        bail!("{message_id} is not among the messages read from {chat_id}");
+    }
+    let outcome = client.remove_message(&chat_id, message_id, 1).await?;
+    report_delete(json, &chat_id, message_id, "me", outcome)
+}
+
+fn report_delete(
+    json: bool,
+    chat_id: &str,
+    message_id: &str,
+    scope: &str,
+    outcome: DeleteOutcome,
+) -> Result<()> {
+    let accepted = match scope {
+        "everyone" => matches!(outcome, DeleteOutcome::Emptied | DeleteOutcome::Gone),
+        _ => outcome == DeleteOutcome::Gone,
+    };
+    if json {
+        return print_json(&json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "scope": scope,
+            "accepted": accepted,
+            "outcome": match outcome {
+                DeleteOutcome::Emptied => "emptied",
+                DeleteOutcome::Gone => "gone",
+                DeleteOutcome::Unchanged => "unchanged",
+            },
+        }));
+    }
+    let what = if scope == "everyone" {
+        "unsent for everyone"
+    } else {
+        "removed from your view"
+    };
+    if accepted {
+        println!("{message_id} {what} in {chat_id}");
+    } else {
+        println!("sent the delete for {message_id} in {chat_id}; the thread still shows it");
     }
     Ok(())
 }

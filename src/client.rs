@@ -9,7 +9,7 @@ use messenger_client::gateway::{Event, Gateway, Socket};
 use messenger_client::{graphql, ls, ops, page};
 use reqwest::Client as HttpClient;
 use serde_json::Value;
-use tokio::time::Instant as TokioInstant;
+use tokio::time::{Instant as TokioInstant, sleep};
 
 use crate::auth::CookieJar;
 
@@ -518,6 +518,105 @@ impl Client {
         socket.close().await;
         Ok(accepted)
     }
+
+    /// Unsend a message for everyone. Meta accepts this only from its sender.
+    pub async fn unsend_message(
+        &self,
+        thread_key: &str,
+        message_id: &str,
+        sync_group: u8,
+    ) -> Result<DeleteOutcome> {
+        let _: i64 = thread_key.parse().context("thread key must be numeric")?;
+        let payload = serde_json::json!({ "message_id": message_id });
+        self.delete_and_check(
+            thread_key,
+            message_id,
+            "33",
+            "unsend_message",
+            payload,
+            sync_group,
+        )
+        .await
+    }
+
+    /// Remove a message from this account's view, for both senders and readers.
+    pub async fn remove_message(
+        &self,
+        thread_key: &str,
+        message_id: &str,
+        sync_group: u8,
+    ) -> Result<DeleteOutcome> {
+        let key: i64 = thread_key.parse().context("thread key must be numeric")?;
+        let payload = serde_json::json!({ "thread_key": key, "message_id": message_id });
+        self.delete_and_check(thread_key, message_id, "155", "155", payload, sync_group)
+            .await
+    }
+
+    /// Task replies are dropped, so the result is what the thread shows afterwards.
+    async fn delete_and_check(
+        &self,
+        thread_key: &str,
+        message_id: &str,
+        label: &str,
+        queue: &str,
+        payload: Value,
+        sync_group: u8,
+    ) -> Result<DeleteOutcome> {
+        let _: i64 = thread_key.parse().context("thread key must be numeric")?;
+        let (mut socket, _database, _names) = self.sync_socket(sync_group).await?;
+        socket
+            .send_task(label, queue, payload)
+            .await
+            .context("sending the delete task")?;
+
+        let ack = TokioInstant::now() + Duration::from_secs(5);
+        while let Some(event) = socket.next_event(ack).await? {
+            if matches!(event, Event::TaskDone) {
+                break;
+            }
+        }
+
+        socket.close().await;
+
+        // This socket's next fetch still carries the page from before the delete, and the
+        // change lands a few seconds later, so a fresh session has to be polled.
+        let mut outcome = DeleteOutcome::Unchanged;
+        let deadline = TokioInstant::now() + Duration::from_secs(20);
+        while TokioInstant::now() < deadline {
+            sleep(Duration::from_secs(1)).await;
+            let after = self.read_messages(thread_key, 100, sync_group).await?;
+            let now = after
+                .iter()
+                .find(|message| message.message_id == message_id);
+            outcome = match now {
+                None => DeleteOutcome::Gone,
+                Some(message)
+                    if message
+                        .text
+                        .as_deref()
+                        .is_none_or(|text| text.trim().is_empty()) =>
+                {
+                    DeleteOutcome::Emptied
+                }
+                _ => DeleteOutcome::Unchanged,
+            };
+            if outcome != DeleteOutcome::Unchanged {
+                break;
+            }
+        }
+        return Ok(outcome);
+    }
+}
+
+/// What a delete left behind, since the task reply itself is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// The message came back with no text, which is how an unsend renders.
+    Emptied,
+    /// The message is no longer in the thread.
+    Gone,
+    /// The message is unchanged.
+    Unchanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
